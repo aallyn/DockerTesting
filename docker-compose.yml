@@ -2,10 +2,15 @@ version: "3.7"
 
 services:
   rstudio: 
-    build: ./ 
+    build: .
     ports: 
       - "8787:8787"
-    environment:
-      - PASSWORD = rstudio
+    volumes:
+      - /Users/aallyn/GitHub/DockerTesting:/home/rstudio/DockerTesting
+    env_file:
+      - ./secret.env
+
+
+
       
     
