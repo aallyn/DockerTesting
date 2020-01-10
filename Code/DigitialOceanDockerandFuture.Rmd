@@ -1,0 +1,287 @@
+---
+title: "Futures, digital ocean and docker"
+author: "Andrew Allyn"
+date: "12/27/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This document provides a quick overview and introduction to facilitate faster and more effecient data analysis using the R future library, DigitalOcean and Docker. It generally walks through the example provided by [Andrew Heiss](https://www.andrewheiss.com/blog/2018/07/30/disposable-supercomputer-future/).
+
+## The R future library
+
+Here is a quick example to show the benefits of the R future library. First, we examine the basic R behavior.
+
+```{r}
+library(future)
+
+x<- {
+  cat("Something really computationally intensive\n")
+  10
+}
+
+x
+```
+
+When the previous chunk is run, the cat statement ("Something really computationally intensive\n") is printed to the console during the construction of the x object, signaling that this statement (or whatever we might have here in terms of analysis steps) is evaluated during the creation of the x object. 
+
+Alternatively, using the future `r %<-%` operator, we can see a difference where this statement, or the code that might replace this statement, is not evaluated until we call `r x`.
+
+```{r}
+x %<-% {
+  cat("Something really computationally intensive\n")
+  10
+}
+```
+
+Note, no output yet, until we call `r x`.
+```{r}
+x
+```
+
+Now, the really cool thing about the future library is that we can set things up so that these evaluations are conducted *anywhere.* For example, doing this on multiple cores of your own computer would look something like this.
+```{r}
+plan(multiprocess)
+
+x %<-% {
+  cat("Something really computationally intensive\n")
+  10
+}
+
+x
+```
+
+Or, maybe we have a number of remote computers set up. We can use future and the plan function to evaluate `r x` across those machines.
+```{r}
+ips <- c("192.168.1.1", "192.168.1.2", "192.168.1.3")
+plan(remote, workers = ips)
+
+x %<-% {
+    cat("Something really computationally intensive\n")
+    10
+}
+
+x
+```
+
+An added bonus: future has functions like `r future.apply::future_lapply()` to work on lists and there is also the `r furrr package` with functions like `r future_map()` -- a "future" approach to the `r purrr map()` function. All of these functions will automatically detect and take advantage of whatever plan you have sepecified. For example, `r plan(multiprocess), future_map()` will send chunks of computations to each of the CPU cores and `r plan(remote)` would do the same thing, but on different remote servers. 
+
+## Digital Ocean -- creating droplets.
+There's some intstructions on [Andrew's page](https://www.andrewheiss.com/blog/2018/07/30/disposable-supercomputer-future/) for how to do this manually. Alternatively, we can do this using the `r analogsea package`.
+```{r}
+library(ssh)
+library(analogsea)
+library(tidyverse)
+
+# docklet_create() makes a Linux VPS with Docker pre-installed
+remote_computer <- docklet_create(region = "sfo2", size = "1gb")
+
+# destroy it
+drops<- droplets()
+droplet_delete(drops[[1]])
+```
+
+A key component here is that each droplet needs to have the correct R environment and associated packages installed. This is where docker comes in. There's a whole lot I don't know about docker -- and I relied heavily on Alex. Andrew also provides a nice [overview of docker and RStudio](https://www.andrewheiss.com/blog/2017/04/27/super-basic-practical-guide-to-docker-and-rstudio/). Like everything, there also seems to be many different ways of getting everything set up. For this example, I noticed that Andrew is going to use one of the [docker images with R/tidyverse already set up](https://hub.docker.com/r/rocker/tidyverse/) using a `terminal docker pull` call. I've done a lot with Alex already to get things set up for a docker image with this and some additional functionality, so I wanted to use that image. To do that, though, I followed [these instructions](https://hackernoon.com/publish-your-docker-image-to-docker-hub-10b826793faf) starting with "Let's build it" to get the image we created on docker hub.  
+
+```{r}
+# Create new droplet with the docker testing image I just pushed to docker hub.
+# Path to ssh file...same as the one that is on DigitalOcean.
+ssh_private_key_file <- "/Users/aallyn/.ssh/id_rsa"
+
+# Set up a new droplet with our docker image 
+remote_computer <- docklet_create(name = "dockertesting", region = "sfo2", size = "1gb")
+droplet(remote_computer$id) %>% 
+  docklet_pull("ajall1985/dockertesting:firsttry")
+```
+
+```{r}
+ip<- droplet(remote_computer$id)$networks$v4[[1]]$ip_address
+
+# Path to private SSH key that matches key uploaded to DigitalOcean
+ssh_private_key_file <- "/Users/aallyn/.ssh/id_rsa"
+
+# Connect and create a cluster
+cl <- makeClusterPSOCK(
+  ip,
+
+  # User name; DigitalOcean droplets use root by default
+  user = "root",
+
+  # Use private SSH key registered with DigitalOcean
+  rshopts = c(
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "IdentitiesOnly=yes",
+    "-i", ssh_private_key_file
+  ),
+
+  # Command to run on each remote machine
+  # The script loads the tidyverse Docker image
+  # --net=host allows it to communicate back to this computer
+  rscript = c("sudo", "docker", "run", "--net=host", 
+              "ajall1985/dockertesting:firsttry", "Rscript"),
+
+  # These are additional commands that are run on the remote machine. 
+  # At minimum, the remote machine needs the future library to work—installing furrr also installs future.
+  rscript_args = c(
+    # Create directory for package installation
+    "-e", shQuote("local({p <- Sys.getenv('R_LIBS_USER'); dir.create(p, recursive = TRUE, showWarnings = FALSE); .libPaths(p)})"),
+    # Install furrr and future
+    "-e", shQuote("if (!requireNamespace('furrr', quietly = TRUE)) install.packages('furrr')")
+  ),
+
+  # Actually run this stuff. Set to TRUE if you don't want it to run remotely.
+  dryrun = FALSE
+)
+```
+
+Working...
+```{r}
+plan(cluster, workers = cl)
+
+# Verify that commands run remotely by looking at the name of the remote
+# Create future expression; this doesn't run remotely yet
+remote_name %<-% {
+  Sys.info()[["nodename"]]
+} 
+
+# Run remote expression and see that it's running inside Docker, not locally
+remote_name
+
+# See how many CPU cores the remote machine has
+n_cpus %<-% { parallel::detectCores() } 
+n_cpus
+
+# # Do stuff with data locally
+top_5_worlds <- starwars %>% 
+  filter(!is.na(homeworld)) %>% 
+  count(homeworld, sort = TRUE) %>% 
+  slice(1:5) %>% 
+  mutate(homeworld = fct_inorder(homeworld, ordered = TRUE))
+
+# Create plot remotely, just for fun
+homeworld_plot %<-% { 
+  plot.out<- ggplot(top_5_worlds, aes(x = homeworld, y = n)) +
+    geom_bar(stat = "identity") + 
+    labs(x = "Homeworld", y = "Count", 
+         title = "Most Star Wars characters are from Naboo and Tatooine",
+         subtitle = "It really is a Skywalker/Amidala epic")
+  return(plot.out)
+}
+
+# Run the command remotely and show plot locally
+# Note how we didn't have to load any data on the remote machine. future takes
+# care of all of that for us!
+homeworld_plot
+
+droplet_delete(remote_computer)
+```
+
+## Now, the real deal -- trying out the VAST model example....
+First step, create a new repository on GitHub to host the docker image build information (VASTdocker)
+Next, I just copied over the files we had from the example working with Alex into this repo, and commit/pushed them to master
+After doing that, I went into source tree, opened a new terminal and used `terminal cd` to navigate to the GitHub/VASTdocker repo folder
+Next, I typed `terminal docker login --username=yourhubusername --password=yourpassword` into the terminal window with correct usernames and passwords
+Then, I built the docker image using the `terminal docker build -t $DOCKER_ACC/$DOCKER_REPO:$IMG_TAG .`, where DOCKER_ACC is my docker account, DOCKER_REPO is the image name and IMG_TAG is the image tag.
+After successfully building the image, I pushed it to dockerhub using `terminal sudo docker push $DOCKER_ACC/$DOCKER_REPO:$IMG_TAG`
+Finally, I opened a new project "VASTExample" on DigitalOcean
+
+Now, I think we are ready to create a droplet...
+```{r}
+# Create new droplet with the docker testing image I just pushed to docker hub.
+# Path to ssh file...same as the one that is on DigitalOcean.
+ssh_private_key_file <- "/Users/aallyn/.ssh/id_rsa"
+
+# Set up a new droplet with our docker image -- I wasn't sure how to do this in R...So, I changed the VASTExample to my default project
+remote_computer<- docklet_create(name = "VASTExample", region = "sfo2", size = "16gb")
+
+# Wait a bit here it seems?
+droplet(remote_computer$id) %>% 
+  docklet_pull("ajall1985/vastdocker:GridSet")
+```
+
+All good, now for setting things up to work on the remote machine...
+```{r}
+ip<- droplet(remote_computer$id)$networks$v4[[1]]$ip_address
+
+# Path to private SSH key that matches key uploaded to DigitalOcean
+ssh_private_key_file <- "/Users/aallyn/.ssh/id_rsa"
+
+# Connect and create a cluster
+cl <- makeClusterPSOCK(
+  ip,
+
+  # User name; DigitalOcean droplets use root by default
+  user = "root",
+
+  # Use private SSH key registered with DigitalOcean
+  rshopts = c(
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "IdentitiesOnly=yes",
+    "-i", ssh_private_key_file
+  ),
+
+  # Command to run on each remote machine
+  # The script loads the tidyverse Docker image
+  # --net=host allows it to communicate back to this computer
+  rscript = c("sudo", "docker", "run", "--net=host", 
+              "ajall1985/vastdocker:GridSet", "Rscript"),
+
+  # These are additional commands that are run on the remote machine. 
+  # At minimum, the remote machine needs the future library to work—installing furrr also installs future.
+  rscript_args = c(
+    # Create directory for package installation
+    "-e", shQuote("local({p <- Sys.getenv('R_LIBS_USER'); dir.create(p, recursive = TRUE, showWarnings = FALSE); .libPaths(p)})"),
+    # Install furrr and future
+    "-e", shQuote("if (!requireNamespace('furrr', quietly = TRUE)) install.packages('furrr')")
+  ),
+
+  # Actually run this stuff. Set to TRUE if you don't want it to run remotely.
+  dryrun = FALSE
+)
+```
+
+```{r}
+plan(cluster, workers = cl)
+
+# Verify that commands run remotely by looking at the name of the remote
+# Create future expression; this doesn't run remotely yet
+remote_name %<-% {
+  Sys.info()[["nodename"]]
+} 
+
+# Run remote expression and see that it's running inside Docker, not locally
+remote_name
+
+input_grid<- NULL
+
+# Create plot remotely, just for fun
+vast_example %<-% { 
+  library(VAST)
+  library(TMB)
+  
+   input_grid<- NULL
+   
+  # Load example data
+  example<- load_example(data_set="EBS_pollock")
+  
+  # Make settings (turning off bias.correct to save time for example)
+  settings<- make_settings( n_x=100, Region=example$Region, purpose="index", strata.limits=example$strata.limits, bias.correct=FALSE )
+  
+  # Run model
+  fit = fit_model( "settings"=settings, "Lat_i"=example$sampling_data[,'Lat'], "Lon_i"=example$sampling_data[,'Lon'], "t_i"=example$sampling_data[,'Year'], "c_i"=rep(0,nrow(example$sampling_data)), "b_i"=example$sampling_data[,'Catch_KG'], "a_i"=example$sampling_data[,'AreaSwept_km2'], "v_i"=example$sampling_data[,'Vessel'] )
+  return(fit)
+}
+
+# Run the command remotely 
+vast_example
+
+print(Sys.time())
+
+droplet_delete("VASTExample")
+```
+
